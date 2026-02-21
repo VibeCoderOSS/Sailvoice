@@ -1,0 +1,16 @@
+node_modules/
+dist/
+out/
+*.log
+.DS_Store
+.env
+.env.*
+python_service/.venv/
+python_service/.venv-align/
+python_service/__pycache__/
+python_service/app/__pycache__/
+python_service/storage/
+runtime/
+coverage/
+.vscode/
+.pytest_cache/
