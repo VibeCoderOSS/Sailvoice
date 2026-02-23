@@ -46,7 +46,7 @@ function writeJson(filePath, value) {
 function getAppConfig() {
   const configPath = getConfigPath(APP_CONFIG_FILE);
   const defaults = {
-    locale: 'de',
+    locale: 'en',
     outputDir: OUTPUT_ROOT,
     modelCacheDir: MODEL_ROOT,
     performanceProfile: 'standard',
@@ -56,7 +56,7 @@ function getAppConfig() {
   const current = readJson(configPath, {});
   return {
     ...defaults,
-    locale: current.locale === 'en' ? 'en' : 'de',
+    locale: current.locale === 'de' ? 'de' : 'en',
     performanceProfile: current.performanceProfile === 'memory' ? 'memory' : 'standard',
     qualityPreset: ['speed', 'balanced', 'quality'].includes(current.qualityPreset) ? current.qualityPreset : 'balanced',
     allowFallback: current.allowFallback === true
@@ -66,7 +66,7 @@ function getAppConfig() {
 function setAppConfig(nextConfig) {
   const configPath = getConfigPath(APP_CONFIG_FILE);
   const persisted = {
-    locale: nextConfig.locale === 'en' ? 'en' : 'de',
+    locale: nextConfig.locale === 'de' ? 'de' : 'en',
     performanceProfile: nextConfig.performanceProfile === 'memory' ? 'memory' : 'standard',
     qualityPreset: ['speed', 'balanced', 'quality'].includes(nextConfig.qualityPreset) ? nextConfig.qualityPreset : 'balanced',
     allowFallback: nextConfig.allowFallback === true
