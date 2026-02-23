@@ -2,6 +2,8 @@
 
 Open local AI solution by **Ship-42**.
 
+![App Preview](./app_view.png)
+
 Local-first desktop app with a minimal ElevenLabs-like workflow:
 
 - Studio for free text + PDF jobs
