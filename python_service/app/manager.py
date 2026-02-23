@@ -596,7 +596,7 @@ class JobManager:
 
     async def get_runtime_status(self) -> dict[str, Any]:
         runtime = detect_runtime_status()
-        alignment_runtime_ready, probe_reason = await self._probe_alignment_runtime(force=True)
+        alignment_runtime_ready, probe_reason = await self._probe_alignment_runtime(force=False)
         alignment_models_ready = self._whisperx_ready_marker().exists()
         alignment_reason = (
             probe_reason
