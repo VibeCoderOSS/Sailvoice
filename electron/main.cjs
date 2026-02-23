@@ -216,12 +216,25 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  await startPythonService();
   createWindow();
+  startPythonService().catch((error) => {
+    console.error('Python service failed to start', error);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      dialog.showErrorBox('Backend startup failed', String(error));
+    }
+  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
+    }
+    if (!pyProcess) {
+      startPythonService().catch((error) => {
+        console.error('Python service failed to start', error);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          dialog.showErrorBox('Backend startup failed', String(error));
+        }
+      });
     }
   });
 });
