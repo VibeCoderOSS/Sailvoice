@@ -72,6 +72,7 @@ function updateCurrentJobWord(word: WordTiming) {
 
 export function StudioPage() {
   const { t } = useI18n();
+  const localizedDefaultText = t('studioDefaultText');
 
   const serviceUrl = useAppStore((state) => state.serviceUrl);
   const selectedPdfPath = useAppStore((state) => state.selectedPdfPath);
@@ -88,15 +89,14 @@ export function StudioPage() {
   const upsertJob = useAppStore((state) => state.upsertJob);
 
   const [mode, setMode] = useState<InputMode>('text');
-  const [text, setText] = useState(
-    'Willkommen im lokalen Text to Speech Studio. Diese Stimme läuft vollständig auf deinem Mac. Es bleibt für immer gratis. Viel Spass!'
-  );
+  const [text, setText] = useState(localizedDefaultText);
   const [selectedVoiceId, setSelectedVoiceId] = useState<string>('');
   const [includeMp3, setIncludeMp3] = useState(true);
   const [includeMp4, setIncludeMp4] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [languagePrompt, setLanguagePrompt] = useState<LanguagePromptState | null>(null);
+  const lastLocalizedDefaultRef = useRef(localizedDefaultText);
 
   const eventUnsubscribers = useRef<Map<string, () => void>>(new Map());
 
@@ -349,6 +349,17 @@ export function StudioPage() {
       setSelectedVoiceId('');
     }
   }, [selectedVoiceId, voices]);
+
+  useEffect(() => {
+    setText((current) => {
+      const previousLocalizedDefault = lastLocalizedDefaultRef.current;
+      if (current !== previousLocalizedDefault && current.trim() !== '') {
+        return current;
+      }
+      return localizedDefaultText;
+    });
+    lastLocalizedDefaultRef.current = localizedDefaultText;
+  }, [localizedDefaultText]);
 
   useEffect(() => {
     if (!serviceUrl) {
