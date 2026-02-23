@@ -49,6 +49,22 @@ function pickPreferredJobId(
   return sorted[0]?.id ?? null;
 }
 
+async function waitForBackendReady(baseUrl: string, timeoutMs = 30000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const response = await fetch(`${baseUrl}/health`, { cache: 'no-store' });
+      if (response.ok) {
+        return;
+      }
+    } catch {
+      // retry until timeout
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 350));
+  }
+  throw new Error('Backend did not become healthy in time.');
+}
+
 export function App() {
   const { t, locale, setLocale } = useI18n();
   const location = useLocation();
@@ -87,6 +103,7 @@ export function App() {
 
   useEffect(() => {
     let mounted = true;
+    let retryTimer: number | null = null;
 
     const bootstrap = async () => {
       const [url, cfg] = await Promise.all([window.desktopApi.getServiceUrl(), window.desktopApi.getConfig()]);
@@ -96,6 +113,7 @@ export function App() {
       setServiceUrl(url);
       setConfig(cfg);
       setLocale(cfg.locale);
+      await waitForBackendReady(url);
 
       const [jobs, voices] = await Promise.all([listJobs(url), listVoices(url)]);
       if (!mounted) {
@@ -103,17 +121,6 @@ export function App() {
       }
       setJobs(jobs);
       setVoices(voices);
-      try {
-        const missing = await refreshMissingModels(url);
-        if (!mounted) {
-          return;
-        }
-        if (missing.length > 0 && !bootstrapDismissed) {
-          setBootstrapStatus({});
-        }
-      } catch (error) {
-        console.error(error);
-      }
 
       const preferredJobId = pickPreferredJobId(jobs);
       const state = useAppStore.getState();
@@ -121,14 +128,49 @@ export function App() {
       if (state.currentJobSelectionMode !== 'manual' || !selectedExists) {
         setCurrentJobId(preferredJobId);
       }
+
+      void refreshMissingModels(url)
+        .then((missing) => {
+          if (!mounted) {
+            return;
+          }
+          if (missing.length > 0 && !bootstrapDismissed) {
+            setBootstrapStatus({});
+          }
+        })
+        .catch((error) => {
+          console.error(error);
+        });
     };
 
-    bootstrap().catch((error) => {
-      console.error(error);
-    });
+    const scheduleRetry = () => {
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
+      retryTimer = window.setTimeout(() => {
+        void runBootstrap();
+      }, 1500);
+    };
+
+    const runBootstrap = async () => {
+      try {
+        await bootstrap();
+      } catch (error) {
+        console.error(error);
+        if (!mounted) {
+          return;
+        }
+        scheduleRetry();
+      }
+    };
+
+    void runBootstrap();
 
     return () => {
       mounted = false;
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
     };
   }, [bootstrapDismissed, setConfig, setCurrentJobId, setJobs, setLocale, setServiceUrl, setVoices]);
 
