@@ -19,6 +19,8 @@ export const translations = {
     voiceDesign: 'Voice Design',
     auto: 'Automatisch',
     generate: 'Generieren',
+    studioDefaultText:
+      'Willkommen im lokalen Text to Speech Studio. Diese Stimme läuft vollständig auf deinem Mac. Es bleibt für immer gratis. Viel Spass!',
     textPlaceholder: 'Text einfügen oder schreiben. Sprache wird automatisch erkannt.',
     currentWord: 'Aktuelles Wort',
     play: 'Play',
@@ -135,6 +137,8 @@ export const translations = {
     voiceDesign: 'Voice design',
     auto: 'Auto',
     generate: 'Generate',
+    studioDefaultText:
+      'Welcome to the local text-to-speech studio. This voice runs fully on your Mac. It stays free forever. Have fun!',
     textPlaceholder: 'Paste or write text. Language will be auto-detected.',
     currentWord: 'Current word',
     play: 'Play',
