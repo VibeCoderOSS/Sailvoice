@@ -10,7 +10,7 @@ type I18nContextValue = {
 
 const I18nContext = createContext<I18nContextValue | null>(null);
 
-export function I18nProvider({ children, initialLocale = 'de' }: PropsWithChildren<{ initialLocale?: Locale }>) {
+export function I18nProvider({ children, initialLocale = 'en' }: PropsWithChildren<{ initialLocale?: Locale }>) {
   const [locale, setLocale] = useState<Locale>(initialLocale);
 
   const value = useMemo<I18nContextValue>(
