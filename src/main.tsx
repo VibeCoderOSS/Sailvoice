@@ -7,7 +7,7 @@ import './styles/app.css';
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
   <React.StrictMode>
-    <I18nProvider initialLocale="de">
+    <I18nProvider initialLocale="en">
       <HashRouter>
         <App />
       </HashRouter>
