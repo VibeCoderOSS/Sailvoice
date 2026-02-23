@@ -50,8 +50,7 @@ app.add_middleware(
 
 @app.get('/health')
 async def health() -> JSONResponse:
-    runtime_status = await manager.get_runtime_status()
-    return JSONResponse({'status': 'ok', 'backend': manager.engine.backend_label, 'runtime': runtime_status})
+    return JSONResponse({'status': 'ok', 'backend': manager.engine.backend_label})
 
 
 @app.get('/v1/jobs')
