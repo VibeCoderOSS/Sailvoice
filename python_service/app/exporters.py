@@ -1,14 +1,35 @@
 from __future__ import annotations
 
+import os
 import json
+import math
 import shutil
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+from uuid import uuid4
 
 from .config import Settings
 from .schemas import WordTiming
+
+CRAWL_RENDER_FPS = 30
+AUDIO_SYNC_TOLERANCE_MS = 33
+MP4_MIN_RENDER_SIDE = 320
+
+
+ProgressCallback = Callable[[float, str], None]
+
+
+@dataclass(frozen=True, slots=True)
+class CrawlRenderProfile:
+    render_fps: int
+    output_fps: int
+    render_resolution: tuple[int, int]
+    label: str
 
 
 def _run_ffmpeg(args: list[str]) -> None:
@@ -70,6 +91,27 @@ def export_mp3(input_wav: Path, output_mp3: Path, bitrate: str) -> None:
     )
 
 
+def create_silence_wav(duration_ms: int, sample_rate: int, output_wav: Path) -> None:
+    _run_ffmpeg(
+        [
+            'ffmpeg',
+            '-y',
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-f',
+            'lavfi',
+            '-i',
+            f'anullsrc=r={max(8000, sample_rate)}:cl=mono',
+            '-t',
+            _format_seconds(max(1, duration_ms)),
+            '-c:a',
+            'pcm_s16le',
+            str(output_wav),
+        ]
+    )
+
+
 def write_alignment(words: Iterable[WordTiming], output_json: Path) -> None:
     payload = [word.model_dump(mode='json') for word in words]
     output_json.write_text(json.dumps(payload, indent=2), 'utf-8')
@@ -110,6 +152,83 @@ def probe_audio_duration_ms(audio_path: Path) -> int:
     )
     duration_sec = float((probe.stdout or '0').strip() or 0.0)
     return max(1, int(round(duration_sec * 1000)))
+
+
+def _probe_stream_duration_ms(media_path: Path, stream_selector: str) -> int:
+    probe = subprocess.run(
+        [
+            'ffprobe',
+            '-v',
+            'error',
+            '-select_streams',
+            stream_selector,
+            '-show_entries',
+            'stream=duration',
+            '-of',
+            'default=noprint_wrappers=1:nokey=1',
+            str(media_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    raw = (probe.stdout or '').strip()
+    if probe.returncode == 0 and raw:
+        try:
+            duration_sec = float(raw)
+            if duration_sec > 0:
+                return max(1, int(round(duration_sec * 1000)))
+        except ValueError:
+            pass
+    return probe_audio_duration_ms(media_path)
+
+
+def _format_seconds(ms: int) -> str:
+    return f'{max(1, ms) / 1000.0:.3f}'
+
+
+def _notify_progress(callback: ProgressCallback | None, progress: float, message: str) -> None:
+    if callback is None:
+        return
+    callback(min(1.0, max(0.0, float(progress))), message)
+
+
+def _even(value: int) -> int:
+    return max(2, int(value) - (int(value) % 2))
+
+
+def _scale_resolution(base: tuple[int, int], scale: float) -> tuple[int, int]:
+    width, height = base
+    scaled_width = _even(max(MP4_MIN_RENDER_SIDE, int(round(width * scale))))
+    scaled_height = _even(max(MP4_MIN_RENDER_SIDE, int(round(height * scale))))
+    return (scaled_width, scaled_height)
+
+
+def _select_crawl_profile(settings: Settings, audio_duration_ms: int) -> CrawlRenderProfile:
+    duration_ms = max(1, int(audio_duration_ms))
+    output_fps = max(12, int(settings.mp4_fps))
+    base_resolution = _parse_resolution(settings.mp4_resolution)
+
+    if duration_ms <= 45_000:
+        return CrawlRenderProfile(
+            render_fps=30,
+            output_fps=output_fps,
+            render_resolution=base_resolution,
+            label='full',
+        )
+    if duration_ms <= 120_000:
+        return CrawlRenderProfile(
+            render_fps=20,
+            output_fps=output_fps,
+            render_resolution=_scale_resolution(base_resolution, 0.78),
+            label='balanced',
+        )
+    return CrawlRenderProfile(
+        render_fps=12,
+        output_fps=output_fps,
+        render_resolution=_scale_resolution(base_resolution, 0.62),
+        label='fast',
+    )
 
 
 def trim_chunk_silence_inplace(
@@ -213,6 +332,15 @@ def _clip_words_to_audio(words: list[WordTiming], audio_duration_ms: int) -> lis
         )
         cursor = end
 
+    return clipped
+
+
+def _normalize_words_to_audio(words: list[WordTiming], audio_duration_ms: int) -> list[WordTiming]:
+    clipped = _clip_words_to_audio(words, audio_duration_ms)
+    if not clipped:
+        return []
+    if clipped[-1].endMs < audio_duration_ms:
+        clipped[-1] = clipped[-1].model_copy(update={'endMs': audio_duration_ms})
     return clipped
 
 
@@ -340,73 +468,123 @@ def _load_font(image_font: Any, size: int):
     return image_font.load_default()
 
 
-def _render_karaoke_frame(frame_path: Path, words: list[WordTiming], active_index: int, resolution: tuple[int, int]) -> None:
+def _resolve_font(image_font: Any, cache: dict[int, Any], size: int):
+    target = max(14, int(size))
+    if target in cache:
+        return cache[target]
+    cache[target] = _load_font(image_font, target)
+    return cache[target]
+
+
+def _render_crawl_frame(
+    frame_path: Path,
+    words: list[WordTiming],
+    active_index: int,
+    current_ms: int,
+    audio_duration_ms: int,
+    resolution: tuple[int, int],
+    font_cache: dict[int, Any],
+) -> None:
     from PIL import Image, ImageDraw, ImageFont  # imported lazily to keep backend boot resilient
 
     width, height = resolution
-    image = Image.new('RGB', (width, height), (16, 22, 18))
+    image = Image.new('RGB', (width, height), (10, 14, 24))
     draw = ImageDraw.Draw(image)
 
-    title_font = _load_font(ImageFont, 42)
-    text_font = _load_font(ImageFont, 56)
-    tiny_font = _load_font(ImageFont, 28)
+    if not words:
+        image.save(frame_path, format='PNG')
+        return
 
-    header = 'Qwen3 TTS'
-    header_bbox = draw.textbbox((0, 0), header, font=title_font)
-    draw.text(
-        ((width - (header_bbox[2] - header_bbox[0])) / 2, 120),
-        header,
-        fill=(210, 236, 219),
-        font=title_font,
-    )
+    words_per_line = 8
+    line_gap = 28
+    baseline_y = int(height * 0.88)
+    rows: list[list[WordTiming]] = [
+        words[index : index + words_per_line] for index in range(0, len(words), words_per_line)
+    ]
+    total_lines = len(rows)
+    timeline_progress = min(1.0, max(0.0, current_ms / max(1, audio_duration_ms)))
+    max_scroll = max(line_gap, (total_lines + 6) * line_gap)
+    scroll_px = timeline_progress * max_scroll
 
-    start = max(0, active_index - 4)
-    end = min(len(words), active_index + 5)
-    context = words[start:end]
+    for line_idx, row_words in enumerate(rows):
+        if not row_words:
+            continue
+        y = int(baseline_y + (line_idx * line_gap) - scroll_px)
+        if y < -64 or y > (height + 64):
+            continue
 
-    cursor_x = 0
-    word_widths: list[int] = []
-    for word in context:
-        token = f'{word.word} '
-        box = draw.textbbox((0, 0), token, font=text_font)
-        width_px = box[2] - box[0]
-        word_widths.append(width_px)
-        cursor_x += width_px
+        depth = min(1.0, max(0.0, y / max(1, height)))
+        scale = max(0.42, 0.74 - depth * 0.28)
+        font_size = int(20 * scale)
+        line_font = _resolve_font(ImageFont, font_cache, font_size)
+        global_line_start = line_idx * words_per_line
 
-    x = (width - cursor_x) / 2
-    y = height / 2
-    for idx, word in enumerate(context):
-        token = f'{word.word} '
-        global_idx = start + idx
-        fill = (252, 182, 74) if global_idx == active_index else (235, 240, 228)
-        draw.text((x, y), token, fill=fill, font=text_font)
-        x += word_widths[idx]
+        token_measures: list[int] = []
+        for row_word in row_words:
+            token = f'{row_word.word} '
+            token_box = draw.textbbox((0, 0), token, font=line_font)
+            token_measures.append(token_box[2] - token_box[0])
 
-    active = words[active_index]
-    total_ms = max(1, words[-1].endMs)
-    progress = min(1.0, max(0.0, active.endMs / total_ms))
-    bar_margin = 220
-    bar_y = height - 170
-    bar_h = 12
-    draw.rounded_rectangle((bar_margin, bar_y, width - bar_margin, bar_y + bar_h), radius=6, fill=(59, 80, 65))
-    draw.rounded_rectangle(
-        (bar_margin, bar_y, bar_margin + int((width - 2 * bar_margin) * progress), bar_y + bar_h),
-        radius=6,
-        fill=(84, 186, 123),
-    )
+        line_width = sum(token_measures)
+        x = int((width - line_width) / 2)
+        x = int((x - width / 2) * scale + width / 2)
 
-    footer = f'{active.startMs/1000:.1f}s'
-    footer_bbox = draw.textbbox((0, 0), footer, font=tiny_font)
-    draw.text(
-        ((width - (footer_bbox[2] - footer_bbox[0])) / 2, bar_y + 26),
-        footer,
-        fill=(175, 198, 179),
-        font=tiny_font,
-    )
+        for token_idx, row_word in enumerate(row_words):
+            global_idx = global_line_start + token_idx
+            token = f'{row_word.word} '
+            if abs(global_idx - active_index) <= 2:
+                fill = (176, 205, 245)
+            else:
+                shade = max(68, int(152 - (1.0 - depth) * 78))
+                fill = (shade, min(188, shade + 18), min(222, shade + 28))
+            draw.text((x, y), token, fill=fill, font=line_font)
+            x += token_measures[token_idx]
     image.save(frame_path, format='PNG')
 
 
-def _export_plain_mp4(settings: Settings, input_audio: Path, output_mp4: Path) -> None:
+def _parse_resolution(resolution: str) -> tuple[int, int]:
+    if 'x' not in resolution:
+        return (1920, 1080)
+    left, right = resolution.split('x', maxsplit=1)
+    try:
+        return (int(left), int(right))
+    except ValueError:
+        return (1920, 1080)
+
+
+def _build_crawl_frame_plan(
+    words: list[WordTiming],
+    audio_duration_ms: int,
+    render_fps: int = CRAWL_RENDER_FPS,
+) -> list[int]:
+    del words
+    step_ms = 1000.0 / max(1, render_fps)
+    frame_count = max(1, int(math.ceil(audio_duration_ms / step_ms)) + 1)
+    plan: list[int] = []
+    for idx in range(frame_count):
+        value = min(audio_duration_ms, int(round(idx * step_ms)))
+        if plan and value < plan[-1]:
+            value = plan[-1]
+        plan.append(value)
+    if plan[-1] != audio_duration_ms:
+        plan.append(audio_duration_ms)
+    return plan
+
+
+def _validate_output_audio_duration(
+    output_mp4: Path,
+    target_audio_ms: int,
+    tolerance_ms: int = AUDIO_SYNC_TOLERANCE_MS,
+) -> int:
+    rendered_audio_ms = _probe_stream_duration_ms(output_mp4, 'a:0')
+    if rendered_audio_ms + tolerance_ms < target_audio_ms:
+        raise RuntimeError(
+            f'MP4 audio underrun detected ({rendered_audio_ms}ms < {target_audio_ms}ms, tolerance {tolerance_ms}ms).'
+        )
+    return rendered_audio_ms
+
+
+def _export_plain_mp4(settings: Settings, input_audio: Path, output_mp4: Path, target_audio_ms: int) -> None:
     _run_ffmpeg(
         [
             'ffmpeg',
@@ -420,21 +598,36 @@ def _export_plain_mp4(settings: Settings, input_audio: Path, output_mp4: Path) -
             f'color=c=#101612:s={settings.mp4_resolution}:r={settings.mp4_fps}',
             '-i',
             str(input_audio),
+            '-map',
+            '0:v:0',
+            '-map',
+            '1:a:0',
             '-c:v',
             'libx264',
             '-pix_fmt',
             'yuv420p',
             '-preset',
             'veryfast',
+            '-movflags',
+            '+faststart',
             '-c:a',
             'aac',
-            '-shortest',
+            '-af',
+            'apad=pad_dur=1',
+            '-t',
+            _format_seconds(target_audio_ms),
             str(output_mp4),
         ]
     )
 
 
-def _export_ass_karaoke_mp4(settings: Settings, input_audio: Path, words: list[WordTiming], output_mp4: Path) -> None:
+def _export_ass_karaoke_mp4(
+    settings: Settings,
+    input_audio: Path,
+    words: list[WordTiming],
+    output_mp4: Path,
+    target_audio_ms: int,
+) -> None:
     with tempfile.TemporaryDirectory(prefix='qwen3-ass-', dir=settings.runtime_tmp_dir) as tmp_dir:
         ass_path = Path(tmp_dir) / 'karaoke.ass'
         _build_ass(words, ass_path)
@@ -452,6 +645,10 @@ def _export_ass_karaoke_mp4(settings: Settings, input_audio: Path, words: list[W
                 f'color=c=#101612:s={settings.mp4_resolution}:r={settings.mp4_fps}',
                 '-i',
                 str(input_audio),
+                '-map',
+                '0:v:0',
+                '-map',
+                '1:a:0',
                 '-vf',
                 f'ass={ass_path}',
                 '-c:v',
@@ -460,46 +657,95 @@ def _export_ass_karaoke_mp4(settings: Settings, input_audio: Path, words: list[W
                 'yuv420p',
                 '-preset',
                 'veryfast',
+                '-movflags',
+                '+faststart',
                 '-c:a',
                 'aac',
-                '-shortest',
+                '-af',
+                'apad=pad_dur=1',
+                '-t',
+                _format_seconds(target_audio_ms),
                 str(output_mp4),
             ]
         )
 
 
-def _export_image_karaoke_mp4(settings: Settings, input_audio: Path, words: list[WordTiming], output_mp4: Path) -> None:
+def _export_crawl_karaoke_mp4(
+    settings: Settings,
+    input_audio: Path,
+    words: list[WordTiming],
+    output_mp4: Path,
+    target_audio_ms: int,
+    progress_callback: ProgressCallback | None = None,
+) -> None:
     try:
         import PIL  # noqa: F401
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f'Pillow not installed for image karaoke fallback: {exc}') from exc
 
     if not words:
-        _export_plain_mp4(settings, input_audio, output_mp4)
+        _export_plain_mp4(settings, input_audio, output_mp4, target_audio_ms)
         return
 
-    width, height = (1920, 1080)
-    if 'x' in settings.mp4_resolution:
-        left, right = settings.mp4_resolution.split('x', maxsplit=1)
-        width, height = int(left), int(right)
+    profile = _select_crawl_profile(settings, target_audio_ms)
+    render_fps = max(1, int(profile.render_fps))
+    output_fps = max(1, int(profile.output_fps))
+    width, height = profile.render_resolution
+    frame_times = _build_crawl_frame_plan(words, target_audio_ms, render_fps=render_fps)
+    total_frames = max(1, len(frame_times))
+    _notify_progress(
+        progress_callback,
+        0.08,
+        f'mp4_render_profile:{profile.label}:{render_fps}fps:{width}x{height}',
+    )
 
     with tempfile.TemporaryDirectory(prefix='qwen3-frames-', dir=settings.runtime_tmp_dir) as tmp_dir:
         temp_dir = Path(tmp_dir)
-        concat_path = temp_dir / 'frames.txt'
+        active_indices: list[int] = []
+        active_index = 0
+        for frame_ms in frame_times:
+            while active_index + 1 < len(words) and frame_ms >= words[active_index].endMs:
+                active_index += 1
+            active_indices.append(active_index)
 
-        lines: list[str] = []
-        frame_paths: list[Path] = []
-        for idx, word in enumerate(words):
-            duration_sec = max(0.08, (word.endMs - word.startMs) / 1000.0)
-            frame_path = temp_dir / f'frame-{idx:05d}.png'
-            _render_karaoke_frame(frame_path, words, idx, (width, height))
-            frame_paths.append(frame_path)
-            lines.append(_file_for_concat(frame_path))
-            lines.append(f'duration {duration_sec:.3f}')
+        jobs = [(idx, frame_times[idx], active_indices[idx]) for idx in range(total_frames)]
+        progress_step = max(1, total_frames // 60)
+        completed = 0
+        local_state = threading.local()
 
-        lines.append(_file_for_concat(frame_paths[-1]))
-        concat_path.write_text('\n'.join(lines), 'utf-8')
+        def render_job(job: tuple[int, int, int]) -> None:
+            idx, frame_ms, word_index = job
+            frame_path = temp_dir / f'frame-{idx:06d}.png'
+            font_cache = getattr(local_state, 'font_cache', None)
+            if font_cache is None:
+                font_cache = {}
+                setattr(local_state, 'font_cache', font_cache)
+            _render_crawl_frame(
+                frame_path=frame_path,
+                words=words,
+                active_index=word_index,
+                current_ms=frame_ms,
+                audio_duration_ms=target_audio_ms,
+                resolution=(width, height),
+                font_cache=font_cache,
+            )
 
+        max_workers = 1
+        if total_frames >= 80:
+            max_workers = min(8, max(2, (os.cpu_count() or 4) - 1))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for _ in pool.map(render_job, jobs, chunksize=8):
+                completed += 1
+                if completed == 1 or completed == total_frames or (completed % progress_step) == 0:
+                    render_progress = 0.08 + (0.76 * (completed / total_frames))
+                    _notify_progress(
+                        progress_callback,
+                        render_progress,
+                        f'mp4_render_frames:{completed}/{total_frames}',
+                    )
+
+        _notify_progress(progress_callback, 0.87, 'mp4_mux')
         _run_ffmpeg(
             [
                 'ffmpeg',
@@ -507,26 +753,38 @@ def _export_image_karaoke_mp4(settings: Settings, input_audio: Path, words: list
                 '-hide_banner',
                 '-loglevel',
                 'error',
-                '-f',
-                'concat',
-                '-safe',
+                '-start_number',
                 '0',
+                '-framerate',
+                str(render_fps),
                 '-i',
-                str(concat_path),
+                str(temp_dir / 'frame-%06d.png'),
                 '-i',
                 str(input_audio),
+                '-map',
+                '0:v:0',
+                '-map',
+                '1:a:0',
                 '-c:v',
                 'libx264',
                 '-pix_fmt',
                 'yuv420p',
+                '-movflags',
+                '+faststart',
+                '-preset',
+                'veryfast',
                 '-r',
-                str(settings.mp4_fps),
+                str(output_fps),
                 '-c:a',
                 'aac',
-                '-shortest',
+                '-af',
+                'apad=pad_dur=1',
+                '-t',
+                _format_seconds(target_audio_ms),
                 str(output_mp4),
             ]
         )
+        _notify_progress(progress_callback, 0.96, 'mp4_mux_done')
 
 
 def export_karaoke_mp4(
@@ -534,16 +792,44 @@ def export_karaoke_mp4(
     input_audio: Path,
     words: list[WordTiming],
     output_mp4: Path,
-) -> None:
-    audio_duration_ms = probe_audio_duration_ms(input_audio)
-    normalized_words = _clip_words_to_audio(words, audio_duration_ms)
-    _validate_timeline(normalized_words, audio_duration_ms)
+    progress_callback: ProgressCallback | None = None,
+) -> str | None:
+    _notify_progress(progress_callback, 0.02, 'mp4_prepare')
+    target_audio_ms = probe_audio_duration_ms(input_audio)
+    normalized_words = _normalize_words_to_audio(words, target_audio_ms)
+    _validate_timeline(normalized_words, target_audio_ms)
+    _notify_progress(progress_callback, 0.06, 'mp4_timeline_ready')
+    fallback_warning: str | None = None
+    output_mp4.parent.mkdir(parents=True, exist_ok=True)
+    temp_output_mp4 = output_mp4.with_name(f'{output_mp4.stem}.{uuid4().hex[:8]}.tmp{output_mp4.suffix}')
     try:
-        _export_ass_karaoke_mp4(settings, input_audio, normalized_words, output_mp4)
-    except Exception as ass_exc:
         try:
-            _export_image_karaoke_mp4(settings, input_audio, normalized_words, output_mp4)
-        except Exception as image_exc:
-            raise RuntimeError(
-                f'Karaoke export failed (ass={ass_exc}; image={image_exc})'
-            ) from image_exc
+            _export_crawl_karaoke_mp4(
+                settings=settings,
+                input_audio=input_audio,
+                words=normalized_words,
+                output_mp4=temp_output_mp4,
+                target_audio_ms=target_audio_ms,
+                progress_callback=progress_callback,
+            )
+        except Exception as crawl_exc:
+            try:
+                _notify_progress(progress_callback, 0.60, 'mp4_plain_fallback')
+                _export_plain_mp4(settings, input_audio, temp_output_mp4, target_audio_ms)
+                fallback_warning = (
+                    'Crawl renderer failed; plain fallback used (no burned text). '
+                    f'Reason: {crawl_exc}'
+                )
+            except Exception as plain_exc:
+                raise RuntimeError(
+                    f'Karaoke export failed (crawl={crawl_exc}; plain={plain_exc})'
+                ) from plain_exc
+
+        _validate_output_audio_duration(temp_output_mp4, target_audio_ms)
+        _notify_progress(progress_callback, 0.99, 'mp4_validate_done')
+        temp_output_mp4.replace(output_mp4)
+    finally:
+        if temp_output_mp4.exists():
+            temp_output_mp4.unlink(missing_ok=True)
+    _notify_progress(progress_callback, 1.0, 'mp4_done')
+    return fallback_warning
