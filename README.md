@@ -130,9 +130,18 @@ npm run dev
 
 This starts:
 
-- Vite renderer on `http://127.0.0.1:5173`
+- Vite renderer on `http://127.0.0.1:5173` (or the next free local port)
 - Electron desktop shell
 - Python API service on `http://127.0.0.1:8765` (spawned by Electron main process)
+
+## Run (built app)
+
+```bash
+npm run build
+npm run start
+```
+
+`npm run build` only builds the renderer. It does not launch the app by itself.
 
 ## API (local service)
 
