@@ -28,14 +28,17 @@ export function PdfReaderPage() {
 
   useEffect(() => {
     const onResize = () => {
-      const width = Math.max(320, Math.min(window.innerWidth - 420, 940));
-      setPageWidth(width);
+      const maxWidth = Math.max(320, Math.min(window.innerWidth - 420, 920));
+      const availableHeight = Math.max(420, window.innerHeight - 260);
+      const heightBoundWidth = (availableHeight * pdfSourceWidth) / pdfSourceHeight;
+      const width = Math.max(320, Math.min(maxWidth, heightBoundWidth));
+      setPageWidth(Math.round(width));
     };
 
     onResize();
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
-  }, []);
+  }, [pdfSourceHeight, pdfSourceWidth]);
 
   const highlight = useMemo(() => {
     if (!activeWord?.bbox || activeWord.page === null || activeWord.page + 1 !== selectedPdfPage) {
@@ -60,45 +63,80 @@ export function PdfReaderPage() {
   };
 
   return (
-    <section className="page">
-      <h2 className="page-title">{t('navReader')}</h2>
+    <section className="page page-reader">
+      <header className="page-header page-header-compact">
+        <div className="page-header-copy">
+          <span className="page-kicker">{t('navReader')}</span>
+          <h2 className="page-title">{t('navReader')}</h2>
+        </div>
+      </header>
 
       {!selectedPdfPath ? (
         <article className="panel panel-muted">
           <p className="kv">{t('noPdf')}</p>
         </article>
       ) : (
-        <article className="panel">
-          <div className="row-between reader-toolbar">
-            <div className="row reader-toolbar-nav">
-              <button className="btn" type="button" onClick={prevPage}>
-                ←
-              </button>
-              <span className="kv">
-                {t('page')} {selectedPdfPage}/{numPages || 1}
-              </span>
-              <button className="btn" type="button" onClick={nextPage}>
-                →
-              </button>
+        <div className="reader-layout">
+          <article className="panel reader-stage">
+            <div className="reader-toolbar-card">
+              <div>
+                <span className="section-eyebrow">{t('pdf')}</span>
+                <strong>{selectedPdfPath.split('/').pop()}</strong>
+              </div>
+              <div className="row reader-toolbar-nav">
+                <button className="btn reader-nav-btn" type="button" onClick={prevPage}>
+                  ←
+                </button>
+                <span className="status-pill tone-neutral">
+                  {t('page')} {selectedPdfPage}/{numPages || 1}
+                </span>
+                <button className="btn reader-nav-btn" type="button" onClick={nextPage}>
+                  →
+                </button>
+              </div>
             </div>
-          </div>
 
-          <div className="pdf-canvas-wrap">
-            <Document file={selectedPdfPath} onLoadSuccess={({ numPages: pages }) => setNumPages(pages)}>
-              <Page
-                pageNumber={selectedPdfPage}
-                width={pageWidth}
-                onRenderSuccess={(page) => {
-                  const viewport = page.getViewport({ scale: 1 });
-                  setPdfSourceWidth(viewport.width);
-                  setPdfSourceHeight(viewport.height);
-                  setPageHeight((viewport.height / viewport.width) * pageWidth);
-                }}
-              />
-            </Document>
-            {highlight ? <div className="highlight-word" style={highlight} /> : null}
-          </div>
-        </article>
+            <div className="pdf-stage-shell">
+              <div className="pdf-canvas-wrap">
+                <Document file={selectedPdfPath} onLoadSuccess={({ numPages: pages }) => setNumPages(pages)}>
+                  <Page
+                    pageNumber={selectedPdfPage}
+                    width={pageWidth}
+                    onRenderSuccess={(page) => {
+                      const viewport = page.getViewport({ scale: 1 });
+                      setPdfSourceWidth(viewport.width);
+                      setPdfSourceHeight(viewport.height);
+                      setPageHeight((viewport.height / viewport.width) * pageWidth);
+                    }}
+                  />
+                </Document>
+                {highlight ? <div className="highlight-word" style={highlight} /> : null}
+              </div>
+            </div>
+          </article>
+
+          <aside className="reader-side-column">
+            <article className="panel panel-muted reader-summary-card">
+              <div className="status-inline-grid">
+                <div className="status-inline-item">
+                  <span className="tile-label">{t('currentWord')}</span>
+                  <strong>{activeWord?.word ?? '-'}</strong>
+                </div>
+                <div className="status-inline-item">
+                  <span className="tile-label">{t('queueState')}</span>
+                  <strong>{currentJob?.state ?? '-'}</strong>
+                </div>
+                <div className="status-inline-item">
+                  <span className="tile-label">{t('page')}</span>
+                  <strong>{selectedPdfPage}</strong>
+                </div>
+              </div>
+              <div className="status-note-list">
+                <p className="kv">{t('elapsedTime')}: {Math.max(0, Math.round(currentTimeMs / 1000))}s</p>
+              </div>
+            </article>
+          </aside>
+        </div>
       )}
     </section>
   );
