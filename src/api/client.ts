@@ -48,6 +48,11 @@ export async function deleteJob(baseUrl: string, jobId: string) {
   await client.delete(`/v1/jobs/${jobId}`);
 }
 
+export async function cancelJob(baseUrl: string, jobId: string) {
+  const client = createClient(baseUrl);
+  await client.post(`/v1/jobs/${jobId}/cancel`);
+}
+
 export async function listVoices(baseUrl: string) {
   const client = createClient(baseUrl);
   const { data } = await client.get<VoiceItem[]>('/v1/voices');
@@ -77,7 +82,7 @@ export async function renameVoice(baseUrl: string, voiceId: string, name: string
   return data;
 }
 
-export async function requestVoicePreview(baseUrl: string, payload: { voiceId?: string; text: string; model: ModelId }) {
+export async function requestVoicePreview(baseUrl: string, payload: { voiceId?: string; speaker?: string; text: string; model: ModelId }) {
   const client = createClient(baseUrl);
   const { data } = await client.post<{ assetId: string }>('/v1/voices/preview', payload);
   return data;
@@ -97,6 +102,12 @@ export async function listModels(baseUrl: string) {
 export async function getRuntimeStatus(baseUrl: string) {
   const client = createClient(baseUrl);
   const { data } = await client.get<RuntimeStatus>('/v1/runtime');
+  return data;
+}
+
+export async function warmupRuntime(baseUrl: string) {
+  const client = createClient(baseUrl);
+  const { data } = await client.post<RuntimeStatus>('/v1/runtime/warmup');
   return data;
 }
 
