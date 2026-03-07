@@ -2,7 +2,7 @@ export type ModelId = 'base' | 'customvoice' | 'voicedesign';
 export type ModelCatalogId = ModelId | 'whisperx';
 export type ModelSource = 'mlx' | 'official';
 export type OutputFormat = 'mp3' | 'mp4';
-export type JobState = 'queued' | 'running' | 'waiting_language' | 'done' | 'failed';
+export type JobState = 'queued' | 'running' | 'waiting_language' | 'canceling' | 'done' | 'failed' | 'canceled';
 export type Mp4State = 'not_requested' | 'queued' | 'running' | 'done' | 'failed';
 export type AlignmentState = 'queued' | 'running' | 'done' | 'failed';
 export type VoiceType = 'clone' | 'design';
@@ -13,6 +13,8 @@ export type JobPhase =
   | 'synthesizing'
   | 'aligning'
   | 'merge_export'
+  | 'canceling'
+  | 'canceled'
   | 'done'
   | 'failed';
 
@@ -46,9 +48,11 @@ export interface JobStatus {
   statusMessage: string | null;
   mp4State: Mp4State;
   mp4Error: string | null;
+  mp4Progress?: number | null;
   alignmentState: AlignmentState;
   alignmentError: string | null;
   alignmentCoverage?: number | null;
+  alignmentRetryCount?: number | null;
   audioDurationMs?: number | null;
   createdAt: string;
   updatedAt: string;
@@ -59,6 +63,7 @@ export interface JobStatus {
   artifacts: Artifact[];
   warning: string | null;
   error: string | null;
+  cancelReason?: string | null;
   phase: JobPhase;
   phaseProgress: number | null;
   alignmentWarning: string | null;
@@ -82,6 +87,8 @@ export interface AppConfig {
   performanceProfile: 'standard' | 'memory';
   qualityPreset: 'speed' | 'balanced' | 'quality';
   allowFallback: boolean;
+  defaultIncludeMp3: boolean;
+  defaultIncludeMp4: boolean;
 }
 
 export interface ModelInfo {
@@ -96,6 +103,7 @@ export interface JobRequestText {
   text: string;
   model: ModelId;
   voiceId?: string;
+  speaker?: string;
   language?: string;
   outputFormats: OutputFormat[];
 }
@@ -104,6 +112,7 @@ export interface JobRequestPdf {
   pdfPath: string;
   model: ModelId;
   voiceId?: string;
+  speaker?: string;
   language?: string;
   pageRange?: { start: number; end: number };
   outputFormats: OutputFormat[];
@@ -111,6 +120,7 @@ export interface JobRequestPdf {
 
 export type JobEvent =
   | { type: 'progress'; progress: number; message: string; phase?: JobPhase | null; phaseProgress?: number | null }
+  | { type: 'mp4_background_progress'; progress: number; message: string }
   | { type: 'warning'; message: string }
   | { type: 'alignment_progress'; progress: number; message: string }
   | { type: 'alignment_done'; coverage: number }
@@ -125,6 +135,7 @@ export type JobEvent =
       reason: string;
     }
   | { type: 'done' }
+  | { type: 'canceled'; message: string }
   | { type: 'error'; message: string };
 
 export interface RuntimeStatus {
@@ -139,4 +150,7 @@ export interface RuntimeStatus {
   alignmentReason?: string | null;
   alignmentProbeAt?: string | null;
   alignmentProbeError?: string | null;
+  warmupState?: 'idle' | 'running' | 'ready' | 'failed' | null;
+  warmupError?: string | null;
+  warmupAt?: string | null;
 }
