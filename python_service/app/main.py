@@ -78,6 +78,17 @@ async def delete_job(job_id: str) -> JSONResponse:
     return JSONResponse({'ok': True})
 
 
+@app.post('/v1/jobs/{job_id}/cancel')
+async def cancel_job(job_id: str) -> JSONResponse:
+    try:
+        await manager.cancel_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail='Job not found') from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse({'ok': True})
+
+
 @app.post('/v1/jobs/text', response_model=JobCreatedResponse)
 async def create_text_job(request: JobRequestText) -> JobCreatedResponse:
     try:
@@ -120,7 +131,7 @@ async def stream_job_events(request: Request, job_id: str) -> StreamingResponse:
                     continue
 
                 yield f'data: {json.dumps(event)}\n\n'
-                if event.get('type') in {'done', 'error'}:
+                if event.get('type') in {'done', 'error', 'canceled'}:
                     break
         finally:
             await manager.unsubscribe(job_id, queue)
@@ -176,6 +187,7 @@ async def preview_voice(request: VoicePreviewRequest) -> VoicePreviewResponse:
             text=request.text,
             model_id=request.model,
             voice_id=request.voiceId,
+            speaker=request.speaker,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -204,6 +216,12 @@ async def download_model(request: ModelDownloadRequest) -> ModelDownloadResponse
 @app.get('/v1/runtime', response_model=RuntimeStatusResponse)
 async def runtime_status() -> RuntimeStatusResponse:
     payload = await manager.get_runtime_status()
+    return RuntimeStatusResponse.model_validate(payload)
+
+
+@app.post('/v1/runtime/warmup', response_model=RuntimeStatusResponse)
+async def runtime_warmup() -> RuntimeStatusResponse:
+    payload = await manager.warmup_runtime(models=['customvoice'], include_alignment_probe=True)
     return RuntimeStatusResponse.model_validate(payload)
 
 
