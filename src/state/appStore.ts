@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type { AppConfig, JobStatus, VoiceItem } from '../types/models';
 
 type AudioQueueItem = {
+  jobId: string;
   assetId: string;
   startMs: number;
   endMs: number;
@@ -16,6 +17,7 @@ type AppState = {
   selectedPdfPage: number;
   currentJobId: string | null;
   currentJobSelectionMode: 'auto' | 'manual';
+  activePlaybackJobId: string | null;
   currentTimeMs: number;
   pendingSeekMs: number | null;
   isPlaying: boolean;
@@ -24,17 +26,19 @@ type AppState = {
   setConfig: (config: AppConfig) => void;
   setJobs: (jobs: JobStatus[]) => void;
   upsertJob: (job: JobStatus) => void;
+  removeJob: (jobId: string) => void;
   setVoices: (voices: VoiceItem[]) => void;
   setSelectedPdfPath: (path: string | null) => void;
   setSelectedPdfPage: (page: number) => void;
   setCurrentJobId: (jobId: string | null) => void;
   setCurrentJobIdManual: (jobId: string | null) => void;
+  setActivePlaybackJobId: (jobId: string | null) => void;
   setCurrentTimeMs: (ms: number) => void;
   setPendingSeekMs: (ms: number | null) => void;
   setIsPlaying: (value: boolean) => void;
   enqueueAudioChunk: (item: AudioQueueItem) => void;
-  clearAudioQueue: () => void;
-  dequeueAudioChunk: () => AudioQueueItem | undefined;
+  clearAudioQueue: (jobId?: string | null) => void;
+  dequeueAudioChunk: (jobId: string) => AudioQueueItem | undefined;
 };
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -46,6 +50,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedPdfPage: 1,
   currentJobId: null,
   currentJobSelectionMode: 'auto',
+  activePlaybackJobId: null,
   currentTimeMs: 0,
   pendingSeekMs: null,
   isPlaying: false,
@@ -63,6 +68,21 @@ export const useAppStore = create<AppState>((set, get) => ({
       next[index] = job;
       return { jobs: next };
     }),
+  removeJob: (jobId) =>
+    set((state) => {
+      const isCurrent = state.currentJobId === jobId;
+      const isActivePlayback = state.activePlaybackJobId === jobId;
+      return {
+        jobs: state.jobs.filter((item) => item.id !== jobId),
+        currentJobId: isCurrent ? null : state.currentJobId,
+        currentJobSelectionMode: isCurrent ? 'auto' : state.currentJobSelectionMode,
+        activePlaybackJobId: isActivePlayback ? null : state.activePlaybackJobId,
+        currentTimeMs: isActivePlayback ? 0 : state.currentTimeMs,
+        pendingSeekMs: isActivePlayback ? null : state.pendingSeekMs,
+        isPlaying: isActivePlayback ? false : state.isPlaying,
+        audioQueue: state.audioQueue.filter((item) => item.jobId !== jobId),
+      };
+    }),
   setVoices: (voices) => set({ voices }),
   setSelectedPdfPath: (path) => set({ selectedPdfPath: path, selectedPdfPage: 1 }),
   setSelectedPdfPage: (page) => set({ selectedPdfPage: page }),
@@ -72,21 +92,34 @@ export const useAppStore = create<AppState>((set, get) => ({
       currentJobId: jobId,
       currentJobSelectionMode: jobId ? 'manual' : 'auto'
     }),
+  setActivePlaybackJobId: (jobId) => set({ activePlaybackJobId: jobId }),
   setCurrentTimeMs: (ms) => set({ currentTimeMs: ms }),
   setPendingSeekMs: (ms) => set({ pendingSeekMs: ms }),
   setIsPlaying: (value) => set({ isPlaying: value }),
   enqueueAudioChunk: (item) =>
     set((state) => {
-      const already = state.audioQueue.some((chunk) => chunk.assetId === item.assetId);
+      const already = state.audioQueue.some((chunk) => chunk.assetId === item.assetId && chunk.jobId === item.jobId);
       if (already) {
         return state;
       }
       return { audioQueue: [...state.audioQueue, item].sort((a, b) => a.startMs - b.startMs) };
     }),
-  clearAudioQueue: () => set({ audioQueue: [] }),
-  dequeueAudioChunk: () => {
-    const [first, ...rest] = get().audioQueue;
-    set({ audioQueue: rest });
+  clearAudioQueue: (jobId) =>
+    set((state) => {
+      if (!jobId) {
+        return { audioQueue: [] };
+      }
+      return { audioQueue: state.audioQueue.filter((item) => item.jobId !== jobId) };
+    }),
+  dequeueAudioChunk: (jobId) => {
+    const queue = get().audioQueue;
+    const index = queue.findIndex((item) => item.jobId === jobId);
+    if (index === -1) {
+      return undefined;
+    }
+    const next = [...queue];
+    const [first] = next.splice(index, 1);
+    set({ audioQueue: next });
     return first;
   }
 }));
