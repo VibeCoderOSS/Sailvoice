@@ -10,7 +10,7 @@ ModelId = Literal['base', 'customvoice', 'voicedesign']
 ModelCatalogId = Literal['base', 'customvoice', 'voicedesign', 'whisperx']
 ModelSource = Literal['mlx', 'official']
 OutputFormat = Literal['mp3', 'mp4']
-JobState = Literal['queued', 'running', 'waiting_language', 'done', 'failed']
+JobState = Literal['queued', 'running', 'waiting_language', 'canceling', 'done', 'failed', 'canceled']
 Mp4State = Literal['not_requested', 'queued', 'running', 'done', 'failed']
 AlignmentState = Literal['queued', 'running', 'done', 'failed']
 VoiceType = Literal['clone', 'design']
@@ -21,6 +21,8 @@ JobPhase = Literal[
     'synthesizing',
     'aligning',
     'merge_export',
+    'canceling',
+    'canceled',
     'done',
     'failed',
 ]
@@ -35,6 +37,7 @@ class JobRequestText(BaseModel):
     text: str = Field(min_length=1)
     model: ModelId
     voiceId: str | None = None
+    speaker: str | None = None
     language: str | None = None
     outputFormats: list[OutputFormat] = Field(default_factory=lambda: ['mp3', 'mp4'])
 
@@ -43,6 +46,7 @@ class JobRequestPdf(BaseModel):
     pdfPath: str = Field(min_length=1)
     model: ModelId
     voiceId: str | None = None
+    speaker: str | None = None
     language: str | None = None
     pageRange: PageRange | None = None
     outputFormats: list[OutputFormat] = Field(default_factory=lambda: ['mp3', 'mp4'])
@@ -84,13 +88,16 @@ class JobStatus(BaseModel):
     statusMessage: str | None = None
     mp4State: Mp4State = 'not_requested'
     mp4Error: str | None = None
+    mp4Progress: float | None = None
     alignmentState: AlignmentState = 'queued'
     alignmentError: str | None = None
     alignmentCoverage: float | None = None
+    alignmentRetryCount: int | None = None
     audioDurationMs: int | None = None
     artifacts: list[Artifact] = Field(default_factory=list)
     warning: str | None = None
     error: str | None = None
+    cancelReason: str | None = None
     phase: JobPhase = 'queued'
     phaseProgress: float | None = None
     alignmentWarning: str | None = None
@@ -139,6 +146,7 @@ class VoiceItem(BaseModel):
 
 class VoicePreviewRequest(BaseModel):
     voiceId: str | None = None
+    speaker: str | None = None
     text: str = Field(min_length=1)
     model: ModelId = 'base'
 
@@ -203,6 +211,11 @@ class JobEventError(BaseModel):
     message: str
 
 
+class JobEventCanceled(BaseModel):
+    type: Literal['canceled'] = 'canceled'
+    message: str
+
+
 class JobEventAlignmentProgress(BaseModel):
     type: Literal['alignment_progress'] = 'alignment_progress'
     progress: float
@@ -216,6 +229,12 @@ class JobEventAlignmentDone(BaseModel):
 
 class JobEventAlignmentFailed(BaseModel):
     type: Literal['alignment_failed'] = 'alignment_failed'
+    message: str
+
+
+class JobEventMp4Progress(BaseModel):
+    type: Literal['mp4_background_progress'] = 'mp4_background_progress'
+    progress: float
     message: str
 
 
@@ -239,3 +258,6 @@ class RuntimeStatusResponse(BaseModel):
     alignmentReason: str | None = None
     alignmentProbeAt: str | None = None
     alignmentProbeError: str | None = None
+    warmupState: Literal['idle', 'running', 'ready', 'failed'] | None = None
+    warmupError: str | None = None
+    warmupAt: str | None = None
