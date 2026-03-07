@@ -15,14 +15,17 @@ type QueueChunk = { assetId: string; startMs: number; endMs: number };
 export function PlayerBar({ serviceUrl }: { serviceUrl: string }) {
   const { t } = useI18n();
   const currentJobId = useAppStore((state) => state.currentJobId);
+  const activePlaybackJobId = useAppStore((state) => state.activePlaybackJobId);
   const jobs = useAppStore((state) => state.jobs);
   const audioQueue = useAppStore((state) => state.audioQueue);
   const currentTimeMs = useAppStore((state) => state.currentTimeMs);
   const isPlaying = useAppStore((state) => state.isPlaying);
   const pendingSeekMs = useAppStore((state) => state.pendingSeekMs);
+  const setActivePlaybackJobId = useAppStore((state) => state.setActivePlaybackJobId);
   const setCurrentTimeMs = useAppStore((state) => state.setCurrentTimeMs);
   const setIsPlaying = useAppStore((state) => state.setIsPlaying);
   const setPendingSeekMs = useAppStore((state) => state.setPendingSeekMs);
+  const clearAudioQueue = useAppStore((state) => state.clearAudioQueue);
   const upsertJob = useAppStore((state) => state.upsertJob);
 
   const currentChunkRef = useRef<QueueChunk | null>(null);
@@ -35,13 +38,18 @@ export function PlayerBar({ serviceUrl }: { serviceUrl: string }) {
     serviceUrlRef.current = serviceUrl;
   }, [serviceUrl]);
 
-  const currentJob = useMemo(() => jobs.find((job) => job.id === currentJobId) ?? null, [jobs, currentJobId]);
+  const playbackJobId = activePlaybackJobId ?? currentJobId;
+  const currentJob = useMemo(() => jobs.find((job) => job.id === playbackJobId) ?? null, [jobs, playbackJobId]);
+  const playbackQueue = useMemo(
+    () => audioQueue.filter((item) => item.jobId === playbackJobId),
+    [audioQueue, playbackJobId]
+  );
 
   const durationMs = useMemo(() => {
-    const queueEnd = audioQueue.reduce((max, item) => Math.max(max, item.endMs), 0);
+    const queueEnd = playbackQueue.reduce((max, item) => Math.max(max, item.endMs), 0);
     const persisted = Math.max(0, currentJob?.audioDurationMs ?? 0);
     return Math.max(queueEnd, persisted, audioDurationMs);
-  }, [audioQueue, audioDurationMs, currentJob?.audioDurationMs]);
+  }, [audioDurationMs, currentJob?.audioDurationMs, playbackQueue]);
 
   const hasPlayableAsset = useMemo(() => {
     if (!currentJob) {
@@ -50,17 +58,18 @@ export function PlayerBar({ serviceUrl }: { serviceUrl: string }) {
     if (currentJob.state === 'done') {
       return true;
     }
-    if (audioQueue.length > 0) {
+    if (playbackQueue.length > 0) {
       return true;
     }
     return currentJob.artifacts.some((artifact) => artifact.type === 'mp3' || artifact.type === 'audio_chunk');
-  }, [audioQueue.length, currentJob]);
+  }, [currentJob, playbackQueue.length]);
 
-  const refreshCurrentJob = async () => {
-    if (!serviceUrlRef.current || !currentJobId) {
+  const refreshCurrentJob = async (jobId?: string | null) => {
+    const targetJobId = jobId ?? playbackJobId;
+    if (!serviceUrlRef.current || !targetJobId) {
       return null;
     }
-    const refreshed = await getJob(serviceUrlRef.current, currentJobId);
+    const refreshed = await getJob(serviceUrlRef.current, targetJobId);
     upsertJob(refreshed);
     return refreshed;
   };
@@ -109,16 +118,17 @@ export function PlayerBar({ serviceUrl }: { serviceUrl: string }) {
     return true;
   };
 
-  const playFromFinalAsset = async (seekMs?: number) => {
+  const playFromFinalAsset = async (seekMs?: number, jobOverride: typeof currentJob = null) => {
     const audio = audioRef.current;
     if (!audio) {
       return false;
     }
 
-    let assetId = getPreferredAssetId();
+    const targetJob = jobOverride ?? currentJob;
+    let assetId = getPreferredAssetId(targetJob);
     if (!assetId) {
-      const refreshed = await refreshCurrentJob();
-      assetId = getPreferredAssetId(refreshed ?? currentJob);
+      const refreshed = await refreshCurrentJob(targetJob?.id);
+      assetId = getPreferredAssetId(refreshed ?? targetJob);
     }
     if (!assetId) {
       return false;
@@ -143,8 +153,13 @@ export function PlayerBar({ serviceUrl }: { serviceUrl: string }) {
     }
   };
 
-  const playNextChunk = async () => {
-    const nextChunk = useAppStore.getState().dequeueAudioChunk();
+  const playNextChunk = async (jobId?: string | null) => {
+    const targetJobId = jobId ?? (useAppStore.getState().activePlaybackJobId ?? useAppStore.getState().currentJobId);
+    if (!targetJobId) {
+      setIsPlaying(false);
+      return false;
+    }
+    const nextChunk = useAppStore.getState().dequeueAudioChunk(targetJobId);
     const audio = audioRef.current;
     if (!nextChunk || !audio || !serviceUrlRef.current) {
       currentChunkRef.current = null;
@@ -181,20 +196,41 @@ export function PlayerBar({ serviceUrl }: { serviceUrl: string }) {
 
     setAudioError(null);
 
-    if (currentJob?.state === 'done') {
+    const state = useAppStore.getState();
+    const selectedJobId = state.currentJobId;
+    const activeJobId = state.activePlaybackJobId;
+    if (selectedJobId && selectedJobId !== activeJobId) {
+      if (activeJobId) {
+        clearAudioQueue(activeJobId);
+      }
+      setActivePlaybackJobId(selectedJobId);
+      currentChunkRef.current = null;
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      setAudioDurationMs(0);
+      setCurrentTimeMs(0);
+    } else if (!activeJobId && selectedJobId) {
+      setActivePlaybackJobId(selectedJobId);
+    }
+
+    const playbackTargetJobId = useAppStore.getState().activePlaybackJobId ?? useAppStore.getState().currentJobId;
+    const playbackJob = useAppStore.getState().jobs.find((job) => job.id === playbackTargetJobId) ?? null;
+
+    if (playbackJob?.state === 'done') {
       const nearEnd = durationMs > 0 && currentTimeMs >= Math.max(0, durationMs - 80);
       const seekTarget = nearEnd ? 0 : currentTimeMs;
       if (nearEnd) {
         setCurrentTimeMs(0);
       }
-      const started = await playFromFinalAsset(seekTarget);
+      const started = await playFromFinalAsset(seekTarget, playbackJob);
       if (started) {
         return;
       }
     }
 
     if (!audio.src) {
-      const started = await playNextChunk();
+      const started = await playNextChunk(playbackTargetJobId);
       if (started) {
         return;
       }
@@ -282,10 +318,10 @@ export function PlayerBar({ serviceUrl }: { serviceUrl: string }) {
       return;
     }
 
-    if (!currentChunkRef.current && audioQueue.length > 0) {
+    if (!currentChunkRef.current && playbackQueue.length > 0) {
       void playNextChunk();
     }
-  }, [audioQueue.length]);
+  }, [playbackQueue.length]);
 
   useEffect(() => {
     if (!audioRef.current) {
@@ -339,6 +375,9 @@ export function PlayerBar({ serviceUrl }: { serviceUrl: string }) {
     if (!audioRef.current) {
       return;
     }
+    if (isPlaying || playbackQueue.length > 0) {
+      return;
+    }
     audioRef.current.pause();
     audioRef.current.removeAttribute('src');
     audioRef.current.load();
@@ -347,33 +386,38 @@ export function PlayerBar({ serviceUrl }: { serviceUrl: string }) {
     setCurrentTimeMs(0);
     setIsPlaying(false);
     setAudioError(null);
-  }, [currentJobId, setCurrentTimeMs, setIsPlaying]);
+  }, [currentJob?.audioDurationMs, isPlaying, playbackJobId, playbackQueue.length, setCurrentTimeMs, setIsPlaying]);
 
   return (
     <section className="player-bar">
-      <div className="row player-leading">
-        <button className="btn" type="button" onClick={togglePlayPause} disabled={!hasPlayableAsset}>
+      <div className="player-meta">
+        <div className="player-meta-copy">
+          <span className={`status-pill ${isPlaying ? 'tone-info' : 'tone-neutral'}`}>
+            {isPlaying ? 'LIVE' : t('playbackReady')}
+          </span>
+          <strong>{currentJob?.sourceLabel ?? 'Voice Studio'}</strong>
+        </div>
+        <button className="btn btn-primary player-transport-btn" type="button" onClick={togglePlayPause} disabled={!hasPlayableAsset}>
           {isPlaying ? t('pause') : t('play')}
         </button>
-        <span className="player-time">
-          {formatMs(currentTimeMs)} / {formatMs(durationMs)}
-        </span>
       </div>
 
-      <input
-        className="timeline"
-        type="range"
-        min={0}
-        max={Math.max(durationMs, 1)}
-        value={Math.min(currentTimeMs, durationMs || 0)}
-        onChange={(event) => setPendingSeekMs(Number(event.target.value))}
-      />
-
-      <div className="row player-trailing">
-        <span className="kv">{isPlaying ? 'LIVE' : t('notStarted')}</span>
-        <span className="kv">{currentJob?.statusMessage || '-'}</span>
-        {audioError ? <span className="error">{audioError}</span> : null}
+      <div className="player-timeline-block">
+        <div className="row-between player-time-row">
+          <span className="player-time">{formatMs(currentTimeMs)}</span>
+          <span className="player-time player-time-muted">{formatMs(durationMs)}</span>
+        </div>
+        <input
+          className="timeline"
+          type="range"
+          min={0}
+          max={Math.max(durationMs, 1)}
+          value={Math.min(currentTimeMs, durationMs || 0)}
+          onChange={(event) => setPendingSeekMs(Number(event.target.value))}
+        />
       </div>
+
+      <div className="row player-trailing">{audioError ? <span className="error">{audioError}</span> : null}</div>
     </section>
   );
 }
