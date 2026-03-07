@@ -14,7 +14,12 @@ export function Mp4PreviewDock({ serviceUrl, assetId, title, onClose }: Mp4Previ
           X
         </button>
       </div>
-      <video className="mp4-preview-video" src={`${serviceUrl}/v1/assets/${assetId}`} controls preload="metadata" />
+      <video
+        className="mp4-preview-video"
+        src={`${serviceUrl}/v1/assets/${assetId}`}
+        controls
+        preload="metadata"
+      />
     </aside>
   );
 }
