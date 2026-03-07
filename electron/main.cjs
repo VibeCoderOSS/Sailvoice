@@ -23,6 +23,8 @@ const ALIGN_VENV_PYTHON = path.join(RUNTIME_ROOT, '.venv-align', 'bin', 'python3
 let mainWindow;
 let pyProcess;
 let backendUrl = `http://127.0.0.1:${DEFAULT_PORT}`;
+let backendStartPromise = null;
+let windowBootPromise = null;
 
 function getConfigPath(fileName) {
   fs.mkdirSync(CONFIG_ROOT, { recursive: true });
@@ -51,7 +53,9 @@ function getAppConfig() {
     modelCacheDir: MODEL_ROOT,
     performanceProfile: 'standard',
     qualityPreset: 'balanced',
-    allowFallback: false
+    allowFallback: false,
+    defaultIncludeMp3: true,
+    defaultIncludeMp4: false
   };
   const current = readJson(configPath, {});
   return {
@@ -59,7 +63,9 @@ function getAppConfig() {
     locale: current.locale === 'de' ? 'de' : 'en',
     performanceProfile: current.performanceProfile === 'memory' ? 'memory' : 'standard',
     qualityPreset: ['speed', 'balanced', 'quality'].includes(current.qualityPreset) ? current.qualityPreset : 'balanced',
-    allowFallback: current.allowFallback === true
+    allowFallback: current.allowFallback === true,
+    defaultIncludeMp3: current.defaultIncludeMp3 !== false,
+    defaultIncludeMp4: current.defaultIncludeMp4 === true
   };
 }
 
@@ -69,7 +75,9 @@ function setAppConfig(nextConfig) {
     locale: nextConfig.locale === 'de' ? 'de' : 'en',
     performanceProfile: nextConfig.performanceProfile === 'memory' ? 'memory' : 'standard',
     qualityPreset: ['speed', 'balanced', 'quality'].includes(nextConfig.qualityPreset) ? nextConfig.qualityPreset : 'balanced',
-    allowFallback: nextConfig.allowFallback === true
+    allowFallback: nextConfig.allowFallback === true,
+    defaultIncludeMp3: nextConfig.defaultIncludeMp3 !== false,
+    defaultIncludeMp4: nextConfig.defaultIncludeMp4 === true
   };
   writeJson(configPath, persisted);
 }
@@ -119,69 +127,113 @@ async function waitForHealth(url, timeoutMs = 20000) {
   throw new Error('Python service did not become healthy in time.');
 }
 
-async function startPythonService() {
-  const config = getAppConfig();
-  fs.mkdirSync(config.outputDir, { recursive: true });
-  fs.mkdirSync(config.modelCacheDir, { recursive: true });
-  fs.mkdirSync(TEMP_ROOT, { recursive: true });
-  fs.mkdirSync(HF_HOME, { recursive: true });
-  fs.mkdirSync(HF_HUB_CACHE, { recursive: true });
-  fs.mkdirSync(WHISPER_CACHE, { recursive: true });
-  fs.mkdirSync(ALIGN_MODEL_DIR, { recursive: true });
-
-  const port = process.env.TTS_PORT || `${DEFAULT_PORT}`;
-  backendUrl = `http://127.0.0.1:${port}`;
-
-  const scriptPath = path.join(__dirname, '..', 'python_service', 'run.py');
-  const voiceSecret = getOrCreateVoiceSecret();
-  const pythonBin = fs.existsSync(VENV_PYTHON) ? VENV_PYTHON : 'python3';
-  const alignPythonBin = ALIGN_VENV_PYTHON;
-
-  pyProcess = spawn(pythonBin, [scriptPath, '--port', port], {
-    cwd: WORKSPACE_ROOT,
-    env: {
-      ...process.env,
-      TTS_PORT: port,
-      TTS_MODEL_CACHE_DIR: config.modelCacheDir,
-      TTS_OUTPUT_DIR: config.outputDir,
-      TTS_VOICE_SECRET: voiceSecret,
-      TTS_PERFORMANCE_PROFILE: config.performanceProfile,
-      TTS_QUALITY_PRESET: config.qualityPreset,
-      TTS_ALLOW_MACOS_FALLBACK: config.allowFallback ? '1' : '0',
-      TTS_TMP_DIR: TEMP_ROOT,
-      TTS_WHISPER_CACHE_DIR: WHISPER_CACHE,
-      TTS_WHISPER_MODEL: 'tiny',
-      TTS_ALIGN_PYTHON: alignPythonBin,
-      TTS_ALIGN_MODEL_DIR: ALIGN_MODEL_DIR,
-      TTS_ALIGN_LANGUAGES: 'de,en',
-      TTS_ALIGN_MIN_COVERAGE: '0.97',
-      HF_HOME,
-      HUGGINGFACE_HUB_CACHE: HF_HUB_CACHE,
-      TRANSFORMERS_CACHE: HF_HUB_CACHE,
-      TMPDIR: TEMP_ROOT,
-      TMP: TEMP_ROOT,
-      TEMP: TEMP_ROOT
-    },
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-
-  pyProcess.stdout.on('data', (chunk) => {
-    const message = chunk.toString();
-    process.stdout.write(`[py] ${message}`);
-  });
-
-  pyProcess.stderr.on('data', (chunk) => {
-    const message = chunk.toString();
-    process.stderr.write(`[py:err] ${message}`);
-  });
-
-  pyProcess.on('exit', (code) => {
-    if (code !== 0) {
-      console.error(`Python service exited with code ${code}`);
+async function waitForRendererReady() {
+  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+  if (devServerUrl) {
+    const started = Date.now();
+    while (Date.now() - started < 20000) {
+      try {
+        const response = await fetch(devServerUrl, { cache: 'no-store' });
+        if (response.ok) {
+          return;
+        }
+      } catch {
+        // retry until timeout
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
-  });
+    throw new Error(`Renderer dev server did not become ready in time (${devServerUrl}).`);
+  }
 
-  await waitForHealth(backendUrl);
+  const rendererPath = path.join(__dirname, '..', 'dist', 'renderer', 'index.html');
+  if (!fs.existsSync(rendererPath)) {
+    throw new Error('Renderer build not found. Run "npm run build" before "npm run start".');
+  }
+}
+
+async function startPythonService() {
+  if (backendStartPromise) {
+    return backendStartPromise;
+  }
+
+  const config = getAppConfig();
+  backendStartPromise = (async () => {
+    if (pyProcess) {
+      await waitForHealth(backendUrl);
+      return;
+    }
+
+    fs.mkdirSync(config.outputDir, { recursive: true });
+    fs.mkdirSync(config.modelCacheDir, { recursive: true });
+    fs.mkdirSync(TEMP_ROOT, { recursive: true });
+    fs.mkdirSync(HF_HOME, { recursive: true });
+    fs.mkdirSync(HF_HUB_CACHE, { recursive: true });
+    fs.mkdirSync(WHISPER_CACHE, { recursive: true });
+    fs.mkdirSync(ALIGN_MODEL_DIR, { recursive: true });
+
+    const port = process.env.TTS_PORT || `${DEFAULT_PORT}`;
+    backendUrl = `http://127.0.0.1:${port}`;
+
+    const scriptPath = path.join(__dirname, '..', 'python_service', 'run.py');
+    const voiceSecret = getOrCreateVoiceSecret();
+    const pythonBin = fs.existsSync(VENV_PYTHON) ? VENV_PYTHON : 'python3';
+    const alignPythonBin = ALIGN_VENV_PYTHON;
+
+    pyProcess = spawn(pythonBin, [scriptPath, '--port', port], {
+      cwd: WORKSPACE_ROOT,
+      env: {
+        ...process.env,
+        TTS_PORT: port,
+        TTS_MODEL_CACHE_DIR: config.modelCacheDir,
+        TTS_OUTPUT_DIR: config.outputDir,
+        TTS_VOICE_SECRET: voiceSecret,
+        TTS_PERFORMANCE_PROFILE: config.performanceProfile,
+        TTS_QUALITY_PRESET: config.qualityPreset,
+        TTS_ALLOW_MACOS_FALLBACK: config.allowFallback ? '1' : '0',
+        TTS_TMP_DIR: TEMP_ROOT,
+        TTS_WHISPER_CACHE_DIR: WHISPER_CACHE,
+        TTS_WHISPER_MODEL: 'tiny',
+        TTS_ALIGN_PYTHON: alignPythonBin,
+        TTS_ALIGN_MODEL_DIR: ALIGN_MODEL_DIR,
+        TTS_ALIGN_LANGUAGES: 'de,en',
+        TTS_ALIGN_MIN_COVERAGE: '0.97',
+        HF_HOME,
+        HUGGINGFACE_HUB_CACHE: HF_HUB_CACHE,
+        TRANSFORMERS_CACHE: HF_HUB_CACHE,
+        TMPDIR: TEMP_ROOT,
+        TMP: TEMP_ROOT,
+        TEMP: TEMP_ROOT
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    pyProcess.stdout.on('data', (chunk) => {
+      const message = chunk.toString();
+      process.stdout.write(`[py] ${message}`);
+    });
+
+    pyProcess.stderr.on('data', (chunk) => {
+      const message = chunk.toString();
+      process.stderr.write(`[py:err] ${message}`);
+    });
+
+    pyProcess.on('exit', (code) => {
+      if (code !== 0) {
+        console.error(`Python service exited with code ${code}`);
+      }
+      pyProcess = null;
+      backendStartPromise = null;
+    });
+
+    await waitForHealth(backendUrl);
+  })();
+
+  try {
+    await backendStartPromise;
+  } catch (error) {
+    backendStartPromise = null;
+    throw error;
+  }
 }
 
 function stopPythonService() {
@@ -190,15 +242,17 @@ function stopPythonService() {
   }
   pyProcess.kill('SIGTERM');
   pyProcess = null;
+  backendStartPromise = null;
 }
 
-function createWindow() {
-  mainWindow = new BrowserWindow({
+async function createWindow() {
+  const window = new BrowserWindow({
     width: 1460,
     height: 920,
     minWidth: 1180,
     minHeight: 760,
     backgroundColor: '#f5f7f2',
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -206,35 +260,69 @@ function createWindow() {
       sandbox: true
     }
   });
-
-  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
-  if (devServerUrl) {
-    mainWindow.loadURL(devServerUrl);
-  } else {
-    mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'renderer', 'index.html'));
+  window.center();
+  mainWindow = window;
+  if (process.platform === 'darwin' && app.dock && typeof app.dock.show === 'function') {
+    app.dock.show();
   }
-}
 
-app.whenReady().then(async () => {
-  createWindow();
-  startPythonService().catch((error) => {
-    console.error('Python service failed to start', error);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      dialog.showErrorBox('Backend startup failed', String(error));
+  window.on('closed', () => {
+    if (mainWindow === window) {
+      mainWindow = null;
     }
   });
 
+  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+  if (devServerUrl) {
+    await window.loadURL(devServerUrl);
+  } else {
+    await window.loadFile(path.join(__dirname, '..', 'dist', 'renderer', 'index.html'));
+  }
+
+  if (!window.isDestroyed() && !window.isVisible()) {
+    window.show();
+    window.focus();
+  }
+  return window;
+}
+
+async function bootMainWindow() {
+  if (windowBootPromise) {
+    return windowBootPromise;
+  }
+
+  windowBootPromise = (async () => {
+    try {
+      await Promise.all([waitForRendererReady(), startPythonService()]);
+      const window = await createWindow();
+      if (!window.isDestroyed()) {
+        window.show();
+        window.focus();
+      }
+    } catch (error) {
+      console.error('Application startup failed', error);
+      dialog.showErrorBox('App startup failed', String(error));
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.destroy();
+        mainWindow = null;
+      }
+    } finally {
+      windowBootPromise = null;
+    }
+  })();
+
+  return windowBootPromise;
+}
+
+app.whenReady().then(async () => {
+  if (process.platform === 'darwin' && typeof app.setActivationPolicy === 'function') {
+    app.setActivationPolicy('regular');
+  }
+  await bootMainWindow();
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
-    if (!pyProcess) {
-      startPythonService().catch((error) => {
-        console.error('Python service failed to start', error);
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          dialog.showErrorBox('Backend startup failed', String(error));
-        }
-      });
+      void bootMainWindow();
     }
   });
 });
@@ -263,6 +351,8 @@ ipcMain.handle('config:set', async (_event, partialConfig) => {
     performanceProfile: partialConfig.performanceProfile ?? current.performanceProfile,
     qualityPreset: partialConfig.qualityPreset ?? current.qualityPreset,
     allowFallback: partialConfig.allowFallback ?? current.allowFallback,
+    defaultIncludeMp3: partialConfig.defaultIncludeMp3 ?? current.defaultIncludeMp3,
+    defaultIncludeMp4: partialConfig.defaultIncludeMp4 ?? current.defaultIncludeMp4,
     outputDir: OUTPUT_ROOT,
     modelCacheDir: MODEL_ROOT
   };
