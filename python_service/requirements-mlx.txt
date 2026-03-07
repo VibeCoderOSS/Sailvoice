@@ -1,2 +1,2 @@
 mlx==0.30.6
-mlx-audio==0.3.0
+mlx-audio==0.4.0
