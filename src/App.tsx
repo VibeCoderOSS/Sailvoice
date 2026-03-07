@@ -1,9 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { useI18n } from './i18n/I18nProvider';
 import { useAppStore } from './state/appStore';
-import { downloadModel, getRuntimeStatus, listJobs, listModels, listVoices } from './api/client';
-import { MODELS } from './constants';
+import { downloadModel, getRuntimeStatus, listJobs, listModels, listVoices, warmupRuntime } from './api/client';
 import { StudioPage } from './pages/StudioPage';
 import { PdfReaderPage } from './pages/PdfReaderPage';
 import { VoiceClonePage } from './pages/VoiceClonePage';
@@ -20,18 +19,23 @@ type NavItem = {
   label: string;
 };
 
+function isActiveJobState(state: 'queued' | 'running' | 'waiting_language' | 'canceling' | 'done' | 'failed' | 'canceled') {
+  return state === 'queued' || state === 'running' || state === 'waiting_language' || state === 'canceling';
+}
+
 function pickPreferredJobId(
   jobs: Array<{
     id: string;
-    state: 'queued' | 'running' | 'waiting_language' | 'done' | 'failed';
+    state: 'queued' | 'running' | 'waiting_language' | 'canceling' | 'done' | 'failed' | 'canceled';
     updatedAt: string;
   }>
 ) {
-  if (!jobs.length) {
+  const activeJobs = jobs.filter((job) => isActiveJobState(job.state));
+  if (!activeJobs.length) {
     return null;
   }
   const stateRank = (state: string) => {
-    if (state === 'running' || state === 'waiting_language') {
+    if (state === 'running' || state === 'waiting_language' || state === 'canceling') {
       return 0;
     }
     if (state === 'queued') {
@@ -39,7 +43,7 @@ function pickPreferredJobId(
     }
     return 2;
   };
-  const sorted = [...jobs].sort((left, right) => {
+  const sorted = [...activeJobs].sort((left, right) => {
     const rankDiff = stateRank(left.state) - stateRank(right.state);
     if (rankDiff !== 0) {
       return rankDiff;
@@ -81,6 +85,13 @@ export function App() {
   const [missingModels, setMissingModels] = useState<ModelCatalogId[]>([]);
   const [bootstrapStatus, setBootstrapStatus] = useState<Record<string, string>>({});
   const [bootstrapDownloading, setBootstrapDownloading] = useState(false);
+  const [bootstrapReady, setBootstrapReady] = useState(false);
+  const bootstrapDismissedRef = useRef(false);
+  const warmupScheduledRef = useRef(false);
+
+  useEffect(() => {
+    bootstrapDismissedRef.current = bootstrapDismissed;
+  }, [bootstrapDismissed]);
 
   const resolveMissingModels = (models: ModelInfo[], runtime: RuntimeStatus): ModelCatalogId[] => {
     const required: ModelCatalogId[] = ['base', 'customvoice', 'voicedesign', 'whisperx'];
@@ -121,11 +132,13 @@ export function App() {
       }
       setJobs(jobs);
       setVoices(voices);
+      setBootstrapReady(true);
 
       const preferredJobId = pickPreferredJobId(jobs);
       const state = useAppStore.getState();
-      const selectedExists = state.currentJobId ? jobs.some((job) => job.id === state.currentJobId) : false;
-      if (state.currentJobSelectionMode !== 'manual' || !selectedExists) {
+      const selectedJob = state.currentJobId ? jobs.find((job) => job.id === state.currentJobId) ?? null : null;
+      const selectedIsActive = selectedJob ? isActiveJobState(selectedJob.state) : false;
+      if (!selectedIsActive || state.currentJobSelectionMode !== 'manual') {
         setCurrentJobId(preferredJobId);
       }
 
@@ -134,7 +147,7 @@ export function App() {
           if (!mounted) {
             return;
           }
-          if (missing.length > 0 && !bootstrapDismissed) {
+          if (missing.length > 0 && !bootstrapDismissedRef.current) {
             setBootstrapStatus({});
           }
         })
@@ -160,6 +173,7 @@ export function App() {
         if (!mounted) {
           return;
         }
+        setBootstrapReady(false);
         scheduleRetry();
       }
     };
@@ -172,7 +186,18 @@ export function App() {
         window.clearTimeout(retryTimer);
       }
     };
-  }, [bootstrapDismissed, setConfig, setCurrentJobId, setJobs, setLocale, setServiceUrl, setVoices]);
+  }, [setConfig, setCurrentJobId, setJobs, setLocale, setServiceUrl, setVoices]);
+
+  useEffect(() => {
+    if (!bootstrapReady || !serviceUrl || warmupScheduledRef.current) {
+      return;
+    }
+    warmupScheduledRef.current = true;
+    const timer = window.setTimeout(() => {
+      warmupRuntime(serviceUrl).catch(console.error);
+    }, 2500);
+    return () => window.clearTimeout(timer);
+  }, [bootstrapReady, serviceUrl]);
 
   useEffect(() => {
     if (config?.locale && config.locale !== locale) {
@@ -191,6 +216,19 @@ export function App() {
     ],
     [t]
   );
+
+  const qualityLabel = useMemo(() => {
+    if (!config) {
+      return null;
+    }
+    if (config.qualityPreset === 'speed') {
+      return t('qualitySpeed');
+    }
+    if (config.qualityPreset === 'quality') {
+      return t('qualityHigh');
+    }
+    return t('qualityBalanced');
+  }, [config, t]);
 
   const downloadAllMissingModels = async () => {
     if (!serviceUrl || !missingModels.length) {
@@ -228,56 +266,52 @@ export function App() {
   return (
     <div className="app-shell">
       <aside className="app-sidebar">
-        <div className="logo-block">
-          <div className="brand-mark" aria-hidden="true">
-            <img src={ship42Logo} alt="Ship-42 Logo" className="brand-mark-image" />
-            <div className="brand-mark-copy">
-              <p className="brand-mark-name">Ship-42</p>
-              <p className="brand-mark-motto">Open local AI. Set sail offline.</p>
+        <div className="sidebar-top">
+          <div className="logo-block">
+            <div className="brand-mark" aria-hidden="true">
+              <img src={ship42Logo} alt="Ship-42 Logo" className="brand-mark-image" />
+              <div className="brand-mark-copy">
+                <p className="brand-mark-name">Ship-42</p>
+                <p className="brand-mark-motto">Open local AI. Set sail offline.</p>
+              </div>
             </div>
+            <p className="logo-subtitle">Local speech studio</p>
+            <h1 className="logo-title">Voice Studio</h1>
           </div>
-          <p className="logo-subtitle">Qwen3-TTS</p>
-          <h1 className="logo-title">Voice Studio</h1>
-          <p className="logo-footnote">localship line</p>
+
+          <nav className="nav-list" aria-label="Primary">
+            {navItems.map((item) => {
+              const active = location.pathname === item.path;
+              return (
+                <button
+                  key={item.path}
+                  className={`nav-item ${active ? 'active' : ''}`}
+                  onClick={() => navigate(item.path)}
+                  type="button"
+                >
+                  {item.label}
+                </button>
+              );
+            })}
+          </nav>
         </div>
 
-        <nav className="nav-list" aria-label="Primary">
-          {navItems.map((item) => {
-            const active = location.pathname === item.path;
-            return (
-              <button
-                key={item.path}
-                className={`nav-item ${active ? 'active' : ''}`}
-                onClick={() => navigate(item.path)}
-                type="button"
-              >
-                {item.label}
-              </button>
-            );
-          })}
-        </nav>
-
-        <div className="model-chips">
-          {MODELS.map((model) => (
-            <span key={model.id} className="chip">
-              {model.id.toUpperCase()}
-            </span>
-          ))}
-        </div>
       </aside>
 
       <main className="app-main">
-        <Routes>
-          <Route path="/" element={<Navigate to="/studio" replace />} />
-          <Route path="/studio" element={<StudioPage />} />
-          <Route path="/reader" element={<PdfReaderPage />} />
-          <Route path="/voice-clone" element={<VoiceClonePage />} />
-          <Route path="/voice-design" element={<VoiceDesignPage />} />
-          <Route path="/voices" element={<Navigate to="/voice-clone" replace />} />
-          <Route path="/exports" element={<ExportsPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<Navigate to="/studio" replace />} />
-        </Routes>
+        <div className="app-main-shell">
+          <Routes>
+            <Route path="/" element={<Navigate to="/studio" replace />} />
+            <Route path="/studio" element={<StudioPage />} />
+            <Route path="/reader" element={<PdfReaderPage />} />
+            <Route path="/voice-clone" element={<VoiceClonePage />} />
+            <Route path="/voice-design" element={<VoiceDesignPage />} />
+            <Route path="/voices" element={<Navigate to="/voice-clone" replace />} />
+            <Route path="/exports" element={<ExportsPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="*" element={<Navigate to="/studio" replace />} />
+          </Routes>
+        </div>
       </main>
 
       <ModelBootstrapModal
